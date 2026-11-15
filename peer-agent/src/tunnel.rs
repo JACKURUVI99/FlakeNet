@@ -16,6 +16,7 @@ use tracing::{info, warn};
 pub const PROTO: StreamProtocol = StreamProtocol::new("/flakenet/tunnel/1.0.0");
 pub type Allowed = Arc<Mutex<HashSet<u16>>>;
 const MAX_TUNNELS: usize = 64;
+pub const HEALTH: StreamProtocol = StreamProtocol::new("/flakenet/health/1.0.0");
 pub const IDLE: Duration = Duration::from_secs(300);
 
 /// Bidirectional copy that ends when either side closes or no data flows for `idle`.
@@ -98,10 +99,10 @@ async fn handle(s: libp2p::Stream, allowed: Allowed) -> Result<()> {
     proxy(&mut s, &mut tcp, IDLE).await
 }
 
-pub async fn gateway(listen: SocketAddr, control: stream::Control, peer: PeerId, port: u16, opts: GatewayOpts) -> Result<()> {
+pub async fn gateway(listen: SocketAddr, control: stream::Control, target: tokio::sync::watch::Receiver<(PeerId, u16)>, opts: GatewayOpts) -> Result<()> {
     let l = TcpListener::bind(listen).await?;
     let scheme = if opts.tls.is_some() { "https" } else { "http" };
-    info!(%listen, %peer, port, "GATEWAY listening ({scheme})");
+    info!(%listen, "GATEWAY listening ({scheme})");
     let tunnels = Arc::new(Semaphore::new(MAX_TUNNELS)); // established tunnels
     let sem = Arc::new(Semaphore::new(1024)); // connections still handshaking (time-limited)
     let limiter = Arc::new(RateLimiter::new(opts.rate_per_10s, Duration::from_secs(10)));
@@ -110,6 +111,7 @@ pub async fn gateway(listen: SocketAddr, control: stream::Control, peer: PeerId,
         let (c, addr) = match l.accept().await { Ok(x) => x, Err(e) => { warn!("accept: {e}"); tokio::time::sleep(Duration::from_millis(50)).await; continue; } };
         if !limiter.allow(addr.ip()) { warn!(ip = %addr.ip(), "RATE LIMITED"); continue; }
         let Ok(permit) = sem.clone().try_acquire_owned() else { warn!("gateway busy"); continue; };
+        let (peer, port) = *target.borrow(); // follows failover
         let (mut ctl, acceptor, tunnels) = (control.clone(), acceptor.clone(), tunnels.clone());
         tokio::spawn(async move {
             let _p = permit;
@@ -188,4 +190,45 @@ async fn open(ctl: &mut stream::Control, peer: PeerId, port: u16) -> Result<toki
     let mut s = s.compat();
     s.write_all(&port.to_be_bytes()).await?;
     Ok(s)
+}
+
+/// Worker side of health probes: report whether a deployed workload port accepts TCP connections.
+pub async fn serve_health(mut control: stream::Control, trusted: Vec<PeerId>, allowed: Allowed) {
+    let Ok(mut incoming) = control.accept(HEALTH) else { return };
+    let sem = Arc::new(Semaphore::new(16));
+    while let Some((peer, s)) = incoming.next().await {
+        if !trusted.contains(&peer) { continue; }
+        let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+        let allowed = allowed.clone();
+        tokio::spawn(async move {
+            let _p = permit;
+            let _ = async {
+                let mut s = s.compat();
+                let mut buf = [0u8; 2];
+                tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf)).await??;
+                let port = u16::from_be_bytes(buf);
+                let ok = allowed.lock().unwrap().contains(&port)
+                    && matches!(tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", port))).await, Ok(Ok(_)));
+                s.write_all(&[ok as u8]).await?;
+                s.flush().await?;
+                anyhow::Ok(())
+            }.await;
+        });
+    }
+}
+
+/// Deployer side: true only if the worker answers and reports the workload healthy.
+pub async fn probe(mut ctl: stream::Control, peer: PeerId, port: u16) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let s = ctl.open_stream(peer, HEALTH).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut s = s.compat();
+        s.write_all(&port.to_be_bytes()).await?;
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b).await?;
+        anyhow::Ok(b[0] == 1)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or(false)
 }

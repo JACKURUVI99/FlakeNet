@@ -75,6 +75,12 @@ struct Args {
     /// Require images to carry a valid cosign signature for this public key (implies digest-pinning).
     #[arg(long)]
     cosign_key: Option<String>,
+    /// Deployer: seconds between workload health probes (also refreshes resource records).
+    #[arg(long, default_value_t = 5)]
+    health_interval: u64,
+    /// Deployer: consecutive failed probes before failing over to another worker.
+    #[arg(long, default_value_t = 3)]
+    health_failures: u32,
 }
 
 #[derive(NetworkBehaviour)]
@@ -136,6 +142,15 @@ async fn main() -> Result<()> {
     let sched_timer = tokio::time::sleep(Duration::from_secs(args.schedule_wait));
     tokio::pin!(sched_timer);
     let mut sched_armed = pending_deploy.is_some();
+    let mut current: Option<PeerId> = None;
+    let mut fails: u32 = 0;
+    let mut needs_failover = false;
+    let mut bad: HashSet<PeerId> = HashSet::new();
+    let mut target_tx: Option<tokio::sync::watch::Sender<(PeerId, u16)>> = None;
+    let (health_tx, mut health_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    let mut probe_inflight = false;
+    let mut health = tokio::time::interval(Duration::from_secs(args.health_interval.max(1)));
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (hp, cp) = args.deploy_ports.split_once(':').context("--deploy-ports HOST:CONTAINER")?;
     let (hp, cp): (u16, u16) = (hp.parse()?, cp.parse()?);
     info!(%local_id, "FlakeNet agent identity");
@@ -170,6 +185,7 @@ async fn main() -> Result<()> {
 
     let allowed: tunnel::Allowed = Default::default();
     tokio::spawn(tunnel::serve(swarm.behaviour().stream.new_control(), args.trust.clone(), allowed.clone()));
+    tokio::spawn(tunnel::serve_health(swarm.behaviour().stream.new_control(), args.trust.clone(), allowed.clone()));
     swarm.listen_on(args.listen.clone())?;
 
     for addr in args.bootstrap {
@@ -249,7 +265,12 @@ async fn main() -> Result<()> {
                             }
                         } else {
                             job = None;
-                            if let Some(addr) = args.gateway_listen {
+                            current = Some(peer);
+                            fails = 0;
+                            if let Some(tx) = &target_tx {
+                                info!(%peer, "gateway now routes to new worker");
+                                tx.send_replace((peer, hp));
+                            } else if let Some(addr) = args.gateway_listen {
                                 let ctl = swarm.behaviour().stream.new_control();
                                 let tls = match (&args.tls_cert, &args.tls_key, &args.tls_self_signed) {
                                     (Some(c), Some(k), _) => Some(tunnel::tls_config(&fs::read(c)?, &fs::read(k)?)?),
@@ -257,8 +278,10 @@ async fn main() -> Result<()> {
                                     _ => None,
                                 };
                                 let opts = tunnel::GatewayOpts { tls, rate_per_10s: args.rate_limit };
+                                let (tx, rx) = tokio::sync::watch::channel((peer, hp));
+                                target_tx = Some(tx);
                                 tokio::spawn(async move {
-                                    if let Err(e) = tunnel::gateway(addr, ctl, peer, hp, opts).await { warn!("gateway: {e:#}"); }
+                                    if let Err(e) = tunnel::gateway(addr, ctl, rx, opts).await { warn!("gateway: {e:#}"); }
                                 });
                             }
                         }
@@ -316,6 +339,48 @@ async fn main() -> Result<()> {
                     let r = deploy::sign_request(&signer, &img, hp, cp)?;
                     swarm.behaviour_mut().deploy.send_request(&first, r);
                     job = Some((img, ranked));
+                }
+            }
+            _ = health.tick(), if pending_deploy.is_some() && !sched_armed => {
+                // keep records fresh so failover decisions use live data
+                let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                for p in peers { swarm.behaviour_mut().resources.send_request(&p, ()); }
+                if needs_failover && job.is_none() {
+                    let cands: Vec<(PeerId, record::Body)> = records.iter()
+                        .filter(|(p, _)| swarm.is_connected(p) && !bad.contains(p))
+                        .map(|(p, b)| (*p, b.clone())).collect();
+                    let req = scheduler::Requirements { cpus: deploy::REQ_CPUS, memory_mb: deploy::REQ_MEM_MB };
+                    let mut ranked = scheduler::rank(&cands, &req);
+                    if ranked.is_empty() {
+                        warn!("FAILOVER: no eligible peer; will retry");
+                        bad.clear();
+                    } else {
+                        let img = pending_deploy.clone().unwrap();
+                        let first = ranked.remove(0);
+                        info!(chosen = %first, "FAILOVER: rescheduling workload");
+                        let r = deploy::sign_request(&signer, &img, hp, cp)?;
+                        swarm.behaviour_mut().deploy.send_request(&first, r);
+                        job = Some((img, ranked));
+                        needs_failover = false;
+                    }
+                } else if let (Some(p), false) = (current, probe_inflight) {
+                    probe_inflight = true;
+                    let (ctl, tx) = (swarm.behaviour().stream.new_control(), health_tx.clone());
+                    tokio::spawn(async move { let _ = tx.send(tunnel::probe(ctl, p, hp).await); });
+                }
+            }
+            Some(ok) = health_rx.recv() => {
+                probe_inflight = false;
+                if ok { fails = 0; } else if let Some(p) = current {
+                    fails += 1;
+                    warn!(worker = %p, fails, "health probe failed");
+                    if fails >= args.health_failures {
+                        warn!(worker = %p, "WORKER UNHEALTHY: failing over");
+                        bad.insert(p);
+                        current = None;
+                        fails = 0;
+                        needs_failover = true;
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => { info!("shutting down"); for n in &running { deploy::remove(n); } break; }

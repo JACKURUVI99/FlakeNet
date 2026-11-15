@@ -9,7 +9,8 @@ Build order: P2P networking → container execution → ingress → isolation �
 - Signed, expiring resource records (CPU/RAM), verified by receivers
 - Signed deploy requests, trust allowlist, Podman runner (rootless, caps dropped, loopback-bound)
 - Scheduler: eligibility filter + best-fit ranking with fallback/rescheduling
-- Authenticated TCP tunnel + local HTTP gateway to the scheduled worker
+- Authenticated TCP tunnel + local HTTP/HTTPS gateway (TLS, rate limit, idle timeout) to the scheduled worker
+- Health probes with automatic failover: unhealthy worker -> reschedule elsewhere, gateway repointed (~5s)
 
 ## Test
     cd peer-agent && cargo test          # unit tests
@@ -21,6 +22,8 @@ Build order: P2P networking → container execution → ingress → isolation �
 `--max-workloads`, `--workload-bind`. Gateway: `--gateway-listen`, `--tls-cert/--tls-key` or `--tls-self-signed`, `--rate-limit`.
 
 ## Known gaps
+- Failover does not fence the old worker (partition => two copies); fine for stateless apps, unsafe for databases.
+- Workers answer resource-record requests from any peer (discloses CPU/RAM figures).
 - Resource claims are self-reported (no attestation/challenges yet).
 - `--cosign-key` is implemented but only its fail-closed path is tested (cosign is not installed on the dev box).
 - Replay floor assumes roughly synchronized clocks between deployer and worker.
