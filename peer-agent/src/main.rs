@@ -11,10 +11,12 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId,
 };
+mod api;
 mod config;
 mod deploy;
 mod record;
 mod scheduler;
+mod status;
 mod tunnel;
 use libp2p::{request_response, StreamProtocol};
 use record::SignedRecord;
@@ -81,6 +83,15 @@ struct Args {
     /// Require images to carry a valid cosign signature for this public key (implies digest-pinning).
     #[arg(long)]
     cosign_key: Option<String>,
+    /// Serve a read-only JSON API (and the dashboard) here, e.g. 127.0.0.1:7777. Off by default.
+    #[arg(long)]
+    api_listen: Option<std::net::SocketAddr>,
+    /// Directory of the built dashboard (dashboard/web/dist) to serve at /.
+    #[arg(long)]
+    dashboard_dir: Option<std::path::PathBuf>,
+    /// Allow --api-listen on a non-loopback address (the API is unauthenticated!).
+    #[arg(long)]
+    api_allow_remote: bool,
     /// Deployer: seconds between workload health probes (also refreshes resource records).
     #[arg(long, default_value_t = 5)]
     health_interval: u64,
@@ -108,6 +119,11 @@ struct Behaviour {
     stream: libp2p_stream::Behaviour,
     resources: request_response::json::Behaviour<(), SignedRecord>,
     deploy: request_response::json::Behaviour<deploy::DeployRequest, deploy::DeployResponse>,
+}
+
+fn short(p: &PeerId) -> String {
+    let s = p.to_string();
+    format!("{}…{}", &s[..8], &s[s.len() - 4..])
 }
 
 fn load_or_create_identity(path: &str) -> Result<identity::Keypair> {
@@ -191,6 +207,19 @@ async fn main() -> Result<()> {
     let mut target_tx: Option<tokio::sync::watch::Sender<(PeerId, u16)>> = None;
     let (health_tx, mut health_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
     let mut probe_inflight = false;
+    let started = std::time::Instant::now();
+    let mut events: std::collections::VecDeque<status::Event> = Default::default();
+    let mut peer_addrs: HashMap<PeerId, String> = HashMap::new();
+    let mut rtts: HashMap<PeerId, f64> = HashMap::new();
+    let mut workloads: Vec<status::WorkloadInfo> = Vec::new();
+    let mut health_hist: std::collections::VecDeque<bool> = Default::default();
+    let (status_tx, status_rx) = tokio::sync::watch::channel(status::Status::default());
+    if let Some(addr) = args.api_listen {
+        // Fail startup (not just the background task) on an unsafe bind.
+        api::check_bind(addr, args.api_allow_remote)?;
+        let (dir, remote, rx) = (args.dashboard_dir.clone(), args.api_allow_remote, status_rx.clone());
+        tokio::spawn(async move { if let Err(e) = api::serve(addr, rx, dir, remote).await { tracing::error!("api: {e:#}"); } });
+    }
     let mut health = tokio::time::interval(Duration::from_secs(args.health_interval.max(1)));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (hp, cp) = args.deploy_ports.split_once(':').context("--deploy-ports HOST:CONTAINER")?;
@@ -247,8 +276,13 @@ async fn main() -> Result<()> {
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     info!(%peer_id, addr = %endpoint.get_remote_address(), "connected");
+                    peer_addrs.insert(peer_id, endpoint.get_remote_address().to_string());
+                    status::note(&mut events, "info", format!("peer connected {}", short(&peer_id)));
                 }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => info!(%peer_id, "disconnected"),
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    info!(%peer_id, "disconnected");
+                    status::note(&mut events, "warn", format!("peer disconnected {}", short(&peer_id)));
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                     for a in info.listen_addrs {
                         swarm.behaviour_mut().kad.add_address(&peer_id, a);
@@ -258,6 +292,7 @@ async fn main() -> Result<()> {
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Deploy(request_response::Event::OutboundFailure { peer, error, .. })) => {
                     warn!(%peer, "deploy request failed: {error}");
+                    status::note(&mut events, "error", format!("deploy request to {} failed: {error}", short(&peer)));
                     if let Some((img, rest)) = job.as_mut() {
                         if !rest.is_empty() {
                             let next = rest.remove(0);
@@ -289,6 +324,7 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 warn!(%peer, "DEPLOY DENIED: {e:#}");
+                                status::note(&mut events, "error", format!("denied deploy from {}: {e:#}", short(&peer)));
                                 let _ = swarm.behaviour_mut().deploy.send_response(channel,
                                     deploy::DeployResponse { ok: false, message: format!("{e:#}") });
                             }
@@ -296,6 +332,8 @@ async fn main() -> Result<()> {
                     }
                     request_response::Message::Response { response, .. } => {
                         info!(%peer, ok = response.ok, msg = %response.message, "deploy result");
+                        status::note(&mut events, if response.ok { "success" } else { "error" },
+                            format!("{} replied: {}", short(&peer), if response.ok { "deployed".to_string() } else { response.message.clone() }));
                         if !response.ok {
                             if let Some((img, rest)) = job.as_mut() {
                                 if !rest.is_empty() {
@@ -311,6 +349,7 @@ async fn main() -> Result<()> {
                             fails = 0;
                             if let Some(tx) = &target_tx {
                                 info!(%peer, "gateway now routes to new worker");
+                                status::note(&mut events, "success", format!("gateway now routes to {}", short(&peer)));
                                 tx.send_replace((peer, hp));
                             } else if let Some(addr) = args.gateway_listen {
                                 let ctl = swarm.behaviour().stream.new_control();
@@ -342,11 +381,15 @@ async fn main() -> Result<()> {
                             info!(%peer, cpu = b.cpu_cores, mem_avail_kb = b.mem_available_kb, seq = b.seq, "VERIFIED resource record");
                             if records.len() < 1024 || records.contains_key(&peer) { records.insert(peer, b); }
                         }
-                        Err(e) => warn!(%peer, "REJECTED resource record: {e:#}"),
+                        Err(e) => {
+                            warn!(%peer, "REJECTED resource record: {e:#}");
+                            status::note(&mut events, "error", format!("rejected resource record from {}: {e:#}", short(&peer)));
+                        }
                     },
                 },
                 SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, result: Ok(rtt), .. })) => {
                     info!(%peer, ?rtt, "ping");
+                    rtts.insert(peer, rtt.as_secs_f64() * 1000.0);
                 }
                 _ => {}
             },
@@ -355,12 +398,15 @@ async fn main() -> Result<()> {
                 let resp = match res {
                     Ok(name) => {
                         info!(%peer, image = %img, %name, port, "DEPLOYED workload");
+                        status::note(&mut events, "success", format!("deployed {img} on :{port} for {}", short(&peer)));
+                        workloads.push(status::WorkloadInfo { name: name.clone(), image: img.clone(), host_port: port, started_unix: status::now() });
                         running.push(name.clone());
                         allowed.lock().unwrap().insert(port);
                         deploy::DeployResponse { ok: true, message: name }
                     }
                     Err(e) => {
                         warn!(%peer, "DEPLOY FAILED: {e:#}");
+                        status::note(&mut events, "error", format!("deploy failed for {}: {e:#}", short(&peer)));
                         deploy::DeployResponse { ok: false, message: format!("{e:#}") }
                     }
                 };
@@ -372,12 +418,14 @@ async fn main() -> Result<()> {
                 let req = scheduler::Requirements { cpus: deploy::REQ_CPUS, memory_mb: deploy::REQ_MEM_MB };
                 let mut ranked = scheduler::rank(&cands, &req);
                 info!(candidates = cands.len(), eligible = ranked.len(), "scheduling");
+                status::note(&mut events, "info", format!("scheduling: {} candidates, {} eligible", cands.len(), ranked.len()));
                 if ranked.is_empty() {
                     warn!("no eligible peer for deployment");
                 } else {
                     let img = pending_deploy.clone().unwrap();
                     let first = ranked.remove(0);
                     info!(chosen = %first, %img, "SCHEDULED");
+                    status::note(&mut events, "info", format!("scheduled {img} on {}", short(&first)));
                     let r = deploy::sign_request(&signer, &img, hp, cp)?;
                     swarm.behaviour_mut().deploy.send_request(&first, r);
                     job = Some((img, ranked));
@@ -400,6 +448,7 @@ async fn main() -> Result<()> {
                         let img = pending_deploy.clone().unwrap();
                         let first = ranked.remove(0);
                         info!(chosen = %first, "FAILOVER: rescheduling workload");
+                        status::note(&mut events, "warn", format!("failover: rescheduling to {}", short(&first)));
                         let r = deploy::sign_request(&signer, &img, hp, cp)?;
                         swarm.behaviour_mut().deploy.send_request(&first, r);
                         job = Some((img, ranked));
@@ -413,11 +462,15 @@ async fn main() -> Result<()> {
             }
             Some(ok) = health_rx.recv() => {
                 probe_inflight = false;
+                if health_hist.len() >= 30 { health_hist.pop_front(); }
+                health_hist.push_back(ok);
                 if ok { fails = 0; } else if let Some(p) = current {
                     fails += 1;
                     warn!(worker = %p, fails, "health probe failed");
+                    status::note(&mut events, "warn", format!("health probe failed for {} ({fails})", short(&p)));
                     if fails >= args.health_failures {
                         warn!(worker = %p, "WORKER UNHEALTHY: failing over");
+                        status::note(&mut events, "error", format!("worker {} unhealthy: failing over", short(&p)));
                         bad.insert(p);
                         current = None;
                         fails = 0;
@@ -427,7 +480,24 @@ async fn main() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => { info!("shutting down"); for n in &running { deploy::remove(n); } break; }
         }
-        
+        if args.api_listen.is_some() {
+            let deployment = pending_deploy.as_ref().map(|img| status::DeploymentInfo {
+                image: img.clone(),
+                state: if current.is_some() { "running" } else if needs_failover { "failover" }
+                       else if job.is_some() { "deploying" } else if sched_armed { "scheduling" } else { "failed" },
+                worker: current.map(|p| p.to_string()),
+                host_port: hp, container_port: cp, failed_probes: fails,
+                gateway: args.gateway_listen.map(|a| format!("{}://{a}", if args.tls_cert.is_some() || args.tls_self_signed.is_some() { "https" } else { "http" })),
+                health: health_hist.iter().copied().collect(),
+            });
+            let trusted = args.trust.clone();
+            status_tx.send_replace(status::build(status::Ctx {
+                local_id: local_id.to_string(), started, records: &records,
+                connected: swarm.connected_peers().cloned().collect(),
+                addrs: &peer_addrs, rtts: &rtts, trusted: &trusted,
+                workloads: &workloads, deployment, events: &events,
+            }));
+        }
     }
     Ok(())
 }
