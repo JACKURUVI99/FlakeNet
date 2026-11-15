@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="250 400 700 700" role="img" aria-labelledby="t">
+  <title id="t">FlakeNet</title>
+  <g fill="none" stroke="#B7DEED" stroke-width="35" stroke-linejoin="round" stroke-linecap="butt">
+    <!-- S: two arcs joined by a 45-degree diagonal through the centre -->
+    <path d="M810 540 A316 316 0 0 0 390 540 L810 960 A316 316 0 0 1 390 960" stroke-linecap="butt"/>
+    <!-- snowflake arms -->
+    <path d="M350 750 H850" stroke-linecap="butt"/>
+    <path d="M395 670 L475 750 L395 830" stroke-linecap="butt"/>
+    <path d="M805 670 L725 750 L805 830" stroke-linecap="butt"/>
+    <path d="M600 750 V612 M535 547 L600 612 L665 547" stroke-linecap="butt"/>
+    <path d="M600 750 V888 M535 953 L600 888 L665 953" stroke-linecap="butt"/>
+    <path d="M600 750 L738 612" stroke-linecap="butt"/>
+    <path d="M600 750 L462 888" stroke-linecap="butt"/>
+  </g>
+  <circle cx="600" cy="750" r="42" fill="#B7DEED"/>
+</svg>
