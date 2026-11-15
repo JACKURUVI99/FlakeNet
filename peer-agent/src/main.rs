@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, HashSet}, fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser, Subcommand};
 use libp2p::{
     futures::StreamExt,
     identify, identity, kad,
@@ -11,6 +11,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId,
 };
+mod config;
 mod deploy;
 mod record;
 mod scheduler;
@@ -20,10 +21,15 @@ use record::SignedRecord;
 use tracing::{info, warn};
 
 #[derive(Parser)]
-#[command(name = "flakenet-agent", about = "FlakeNet peer agent")]
+#[command(name = "flakenet", about = "FlakeNet: decentralized cloud peer agent")]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    /// TOML config file (flags override it). Also read from $FLAKENET_CONFIG.
+    #[arg(long)]
+    config: Option<String>,
     /// Path to the Ed25519 identity key (created on first run, mode 0600).
-    #[arg(long, default_value = "flakenet-peer.key")]
+    #[arg(long, global = true, default_value = "flakenet-peer.key")]
     key_file: String,
     /// Address to listen on.
     #[arg(long, default_value = "/ip4/0.0.0.0/udp/0/quic-v1")]
@@ -83,6 +89,17 @@ struct Args {
     health_failures: u32,
 }
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Print this agent's peer ID (creates the key file if missing).
+    Id,
+    /// Write a starter config file.
+    Init {
+        #[arg(long, default_value = "flakenet.toml")]
+        path: String,
+    },
+}
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     kad: kad::Behaviour<MemoryStore>,
@@ -112,12 +129,37 @@ fn load_or_create_identity(path: &str) -> Result<identity::Keypair> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw: Vec<String> = std::env::args().collect();
+    let argv = match config::find_path(&raw) {
+        Some(path) => {
+            let src = fs::read_to_string(&path).with_context(|| format!("reading config {path}"))?;
+            let known: HashSet<String> = Args::command().get_arguments()
+                .filter_map(|a| a.get_long().map(String::from)).collect();
+            config::merge(raw, &src, &known)?
+        }
+        None => raw,
+    };
+    let args = Args::parse_from(argv);
+    match &args.cmd {
+        Some(Cmd::Id) => {
+            let kp = load_or_create_identity(&args.key_file)?;
+            println!("{}", PeerId::from(kp.public()));
+            return Ok(());
+        }
+        Some(Cmd::Init { path }) => {
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)
+                .with_context(|| format!("{path} already exists or cannot be created"))?;
+            f.write_all(config::TEMPLATE.as_bytes())?;
+            println!("wrote {path}");
+            return Ok(());
+        }
+        None => {}
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "flakenet_agent=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "flakenet=info".into()),
         )
         .init();
-    let args = Args::parse();
     let keypair = load_or_create_identity(&args.key_file)?;
     let dt = args.deploy_timeout;
     let local_id = PeerId::from(keypair.public());

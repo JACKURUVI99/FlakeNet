@@ -19,6 +19,16 @@ Build order: P2P networking → container execution → ingress → isolation �
 - Authenticated TCP tunnel + local HTTP/HTTPS gateway (TLS, rate limit, idle timeout) to the scheduled worker
 - Health probes with automatic failover: unhealthy worker -> reschedule elsewhere, gateway repointed (~5s)
 
+## Quick start
+    cd peer-agent && cargo build              # produces target/debug/flakenet
+    flakenet init                             # writes flakenet.toml (all settings, commented)
+    flakenet id                               # prints this machine's peer ID (creates the key)
+    flakenet --config flakenet.toml           # run the agent
+
+Worker: set `trust = ["<deployer peer id>"]` in its config. Deployer: set `bootstrap = ["<worker multiaddr>/p2p/<id>"]`,
+`deploy-image`, `deploy-ports` and `gateway-listen`. Command-line flags override the config file; unknown config keys are rejected.
+Config can also come from `$FLAKENET_CONFIG`.
+
 ## Test
     cd peer-agent && cargo test          # unit tests
     tests/integration/e2e.sh 3           # end-to-end, 3 runs (needs podman)
