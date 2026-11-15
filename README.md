@@ -47,6 +47,3 @@ Config can also come from `$FLAKENET_CONFIG`.
 - Gateway: no ACME, no per-request limiting, no WAF; rate limit is per connection and per source IP.
 - Podman isolation is not microVM-grade; suitable for trusted private peers only.
 - Only tested on one machine (loopback QUIC), not across hosts/NAT.
-
-## Credits
-Logo mark (redrawn as SVG from): "S & Snow" logomark by @nextmahamud, found on Pinterest (https://in.pinterest.com/pin/135389532543855420/). Not created by this project; confirm usage rights before any public release.
