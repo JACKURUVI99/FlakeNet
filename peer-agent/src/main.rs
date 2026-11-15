@@ -89,6 +89,15 @@ struct Args {
     /// Directory of the built dashboard (dashboard/web/dist) to serve at /.
     #[arg(long)]
     dashboard_dir: Option<std::path::PathBuf>,
+    /// Serve the API/dashboard over plain HTTP instead of HTTPS (not recommended).
+    #[arg(long)]
+    api_http: bool,
+    /// PEM certificate/key for the API's HTTPS. Default: an auto-generated local certificate
+    /// (`<key-file>.api.crt`) valid for localhost, 127.0.0.1 and ::1.
+    #[arg(long, requires = "api_tls_key", conflicts_with = "api_http")]
+    api_tls_cert: Option<String>,
+    #[arg(long, requires = "api_tls_cert", conflicts_with = "api_http")]
+    api_tls_key: Option<String>,
     /// Allow --api-listen on a non-loopback address (the API is unauthenticated!).
     #[arg(long)]
     api_allow_remote: bool,
@@ -200,6 +209,7 @@ async fn main() -> Result<()> {
     let sched_timer = tokio::time::sleep(Duration::from_secs(args.schedule_wait));
     tokio::pin!(sched_timer);
     let mut sched_armed = pending_deploy.is_some();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut current: Option<PeerId> = None;
     let mut fails: u32 = 0;
     let mut needs_failover = false;
@@ -217,8 +227,18 @@ async fn main() -> Result<()> {
     if let Some(addr) = args.api_listen {
         // Fail startup (not just the background task) on an unsafe bind.
         api::check_bind(addr, args.api_allow_remote)?;
+        let tls = if args.api_http {
+            warn!("API served over PLAIN HTTP (--api-http)");
+            None
+        } else if let (Some(c), Some(k)) = (&args.api_tls_cert, &args.api_tls_key) {
+            Some(tunnel::tls_config(&fs::read(c)?, &fs::read(k)?)?)
+        } else {
+            let (cfg, crt) = tunnel::local_cert(&format!("{}.api", args.key_file))?;
+            info!("dashboard: https://{addr}  (local certificate: {crt} — browsers will warn until you trust it)");
+            Some(cfg)
+        };
         let (dir, remote, rx) = (args.dashboard_dir.clone(), args.api_allow_remote, status_rx.clone());
-        tokio::spawn(async move { if let Err(e) = api::serve(addr, rx, dir, remote).await { tracing::error!("api: {e:#}"); } });
+        tokio::spawn(async move { if let Err(e) = api::serve(addr, rx, dir, remote, tls).await { tracing::error!("api: {e:#}"); } });
     }
     let mut health = tokio::time::interval(Duration::from_secs(args.health_interval.max(1)));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -478,7 +498,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => { info!("shutting down"); for n in &running { deploy::remove(n); } break; }
+            _ = tokio::signal::ctrl_c() => { info!("shutting down (SIGINT)"); for n in &running { deploy::remove(n); } break; }
+            _ = sigterm.recv() => { info!("shutting down (SIGTERM)"); for n in &running { deploy::remove(n); } break; }
         }
         if args.api_listen.is_some() {
             let deployment = pending_deploy.as_ref().map(|img| status::DeploymentInfo {

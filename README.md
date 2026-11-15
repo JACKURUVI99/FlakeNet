@@ -33,10 +33,15 @@ Config can also come from `$FLAKENET_CONFIG`.
 A React + TypeScript web UI (dark marketplace-style theme; analysis in `docs/design/opensea-analysis.md`).
 
     cd dashboard/web && npm install && npm run build
-    flakenet --config flakenet.toml --api-listen 127.0.0.1:7777 --dashboard-dir dashboard/web/dist
-    # open http://127.0.0.1:7777      (add ?demo to preview with sample data)
+    cd ../.. && ./peer-agent/target/debug/flakenet --api-listen 127.0.0.1:7777 --dashboard-dir dashboard/web/dist
+    # open https://127.0.0.1:7777      (add ?demo to preview with sample data)
 
-Dev server with hot reload: `npm run dev` (proxies `/api` to the agent on 127.0.0.1:7777).
+**HTTPS by default.** A local certificate for `localhost`, `127.0.0.1` and `::1` is generated on first run and stored next to the
+key file (`<key-file>.api.crt` / `.api.key`, key mode 0600); it is reused on restart. Browsers warn about it until you trust that
+`.crt` (import it into your browser/OS, or `curl --cacert <file>`). Bring your own with `--api-tls-cert/--api-tls-key`.
+Plain HTTP is an explicit opt-out: `--api-http`.
+
+Dev server with hot reload: `npm run dev` (proxies `/api` to the agent; start the agent with `--api-http` for that).
 The API is read-only and unauthenticated, so it only binds to loopback (refuses otherwise unless `--api-allow-remote`),
 validates the `Host` header (anti DNS-rebinding) and sets strict security headers.
 

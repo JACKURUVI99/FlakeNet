@@ -67,6 +67,20 @@ pub fn tls_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<ServerConfig>> 
     ))
 }
 
+/// Load `<base>.crt` / `<base>.key`, or create a self-signed pair for loopback names (key is 0600).
+/// Returns the TLS config and the certificate path (so the user can trust it in their browser/OS).
+pub fn local_cert(base: &str) -> Result<(Arc<ServerConfig>, String)> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let (crt, key) = (format!("{base}.crt"), format!("{base}.key"));
+    if !std::path::Path::new(&crt).exists() || !std::path::Path::new(&key).exists() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into(), "::1".into()])?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key)?;
+        f.write_all(ck.signing_key.serialize_pem().as_bytes())?;
+        std::fs::write(&crt, ck.cert.pem())?;
+    }
+    Ok((tls_config(&std::fs::read(&crt)?, &std::fs::read(&key)?)?, crt))
+}
+
 pub fn self_signed(domain: &str) -> Result<Arc<ServerConfig>> {
     let ck = rcgen::generate_simple_self_signed(vec![domain.to_string()])?;
     tls_config(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes())
@@ -179,6 +193,20 @@ mod tests {
         assert_eq!(&buf, b"hello");
         drop(a_peer); drop(b_peer);
         let _ = t.await;
+    }
+
+    #[test]
+    fn local_cert_is_created_once_and_reused() {
+        let dir = std::env::temp_dir().join(format!("fn-cert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("api").to_string_lossy().to_string();
+        let (_, c1) = local_cert(&base).unwrap();
+        let first = std::fs::read(&c1).unwrap();
+        local_cert(&base).unwrap();
+        assert_eq!(first, std::fs::read(&c1).unwrap()); // stable across restarts
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(format!("{base}.key")).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

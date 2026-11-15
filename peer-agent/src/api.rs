@@ -1,7 +1,7 @@
 //! Local read-only HTTP API + static dashboard hosting.
 //! Defence for an unauthenticated local service: loopback-only by default, Host-header
 //! validation (blocks DNS rebinding), strict security headers, GET-only, no secrets in output.
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Result};
 use axum::{
@@ -14,6 +14,8 @@ use axum::{
     Json, Router,
 };
 use tower_http::services::{ServeDir, ServeFile};
+use hyper_util::{rt::{TokioExecutor, TokioIo}, server::conn::auto::Builder, service::TowerToHyperService};
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 use tracing::info;
 
 use crate::status::Status;
@@ -59,7 +61,7 @@ pub fn check_bind(addr: SocketAddr, allow_remote: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn serve(addr: SocketAddr, rx: StatusRx, dashboard: Option<PathBuf>, allow_remote: bool) -> Result<()> {
+pub async fn serve(addr: SocketAddr, rx: StatusRx, dashboard: Option<PathBuf>, allow_remote: bool, tls: Option<Arc<ServerConfig>>) -> Result<()> {
     check_bind(addr, allow_remote)?;
     let mut app = Router::new().route("/api/status", get(status)).route("/api/healthz", get(|| async { "ok" })).with_state(rx);
     if let Some(dir) = dashboard {
@@ -68,9 +70,25 @@ pub async fn serve(addr: SocketAddr, rx: StatusRx, dashboard: Option<PathBuf>, a
     }
     let app = app.layer(middleware::from_fn(move |req, next| guard(req, next, allow_remote)));
     let l = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "API/dashboard listening");
-    axum::serve(l, app).await?;
-    Ok(())
+    let Some(tls) = tls else {
+        info!(%addr, "API/dashboard listening (PLAIN HTTP)");
+        axum::serve(l, app).await?;
+        return Ok(());
+    };
+    info!(%addr, "API/dashboard listening (https)");
+    let acceptor = TlsAcceptor::from(tls);
+    let slots = Arc::new(tokio::sync::Semaphore::new(256));
+    loop {
+        let (tcp, _) = match l.accept().await { Ok(x) => x, Err(_) => { tokio::time::sleep(Duration::from_millis(50)).await; continue; } };
+        let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+        let (acceptor, app) = (acceptor.clone(), app.clone());
+        tokio::spawn(async move {
+            let _p = permit;
+            // time-limited handshake so stalled clients can't hold slots
+            let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await else { return };
+            let _ = Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), TowerToHyperService::new(app)).await;
+        });
+    }
 }
 
 #[cfg(test)]
