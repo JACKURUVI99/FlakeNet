@@ -1,4 +1,9 @@
-<p align="center"><img src="assets/logo.png" alt="FlakeNet logo" width="160"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.svg">
+    <img src="assets/logo-light.svg" alt="FlakeNet logo" width="160">
+  </picture>
+</p>
 
 # FlakeNet
 
@@ -34,4 +39,4 @@ Build order: P2P networking → container execution → ingress → isolation �
 - Only tested on one machine (loopback QUIC), not across hosts/NAT.
 
 ## Credits
-Logo mark: "S & Snow" logomark by @nextmahamud, found on Pinterest (https://in.pinterest.com/pin/135389532543855420/). Not created by this project; confirm usage rights before any public release.
+Logo mark (redrawn as SVG from): "S & Snow" logomark by @nextmahamud, found on Pinterest (https://in.pinterest.com/pin/135389532543855420/). Not created by this project; confirm usage rights before any public release.
